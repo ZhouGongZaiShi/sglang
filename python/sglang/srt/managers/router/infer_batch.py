@@ -1,12 +1,61 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import torch
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
+
+def _get_bin_counts_and_mask(
+        tokens: torch.Tensor,
+        vocab_size: int,
+        num_seqs: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Compute the bin counts for the tokens.
+    # vocab_size + 1 for padding.
+    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                             dtype=torch.long,
+                             device=tokens.device)
+    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+    bin_counts = bin_counts[:, :vocab_size]
+    mask = bin_counts > 0
+
+    return bin_counts, mask
+
+
+def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                     output_tokens_tensor: torch.Tensor,
+                     presence_penalties: torch.Tensor,
+                     frequency_penalties: torch.Tensor,
+                     repetition_penalties: torch.Tensor) -> torch.Tensor:
+    # prompt_tokens_tensor = prompt_tokens_tensor.long()
+    # output_tokens_tensor = output_tokens_tensor.long()
+    #
+    print("sglang _apply_penalties logits", logits)
+    print("sglang _apply_penalties prompt_tokens_tensor", prompt_tokens_tensor)
+    print("sglang _apply_penalties output_tokens_tensor", output_tokens_tensor)
+    # print("sglang _apply_penalties presence_penalties", presence_penalties)
+    # print("sglang _apply_penalties frequency_penalties", frequency_penalties)
+    print("sglang _apply_penalties repetition_penalties", repetition_penalties)
+
+    num_seqs, vocab_size = logits.shape
+    _, prompt_mask = _get_bin_counts_and_mask(prompt_tokens_tensor, vocab_size,
+                                              num_seqs)
+    output_bin_counts, output_mask = _get_bin_counts_and_mask(
+        output_tokens_tensor, vocab_size, num_seqs)
+
+    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+    logits = torch.where(logits > 0, logits / repetition_penalties,
+                         logits * repetition_penalties)
+
+    # We follow the definition in OpenAI API.
+    # # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+    # logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
+    # logits -= presence_penalties.unsqueeze_(dim=1) * output_mask
+    return logits
 
 class ForwardMode(Enum):
     PREFILL = auto()
@@ -22,6 +71,8 @@ class FinishReason(Enum):
 
 class Req:
     def __init__(self, rid, input_text, input_ids):
+        print("req", input_ids, input_text)
+
         self.rid = rid
         self.input_text = input_text
         self.input_ids = input_ids
@@ -199,7 +250,10 @@ class Batch:
         bs = len(self.reqs)
         reqs = self.reqs
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
+        output_ids = [r.output_ids[:] for r in reqs]
         prefix_indices = [r.prefix_indices for r in reqs]
+
+        print("reqs", reqs)
 
         # Handle prefix
         flatten_input_ids = []
@@ -207,10 +261,16 @@ class Batch:
         prefix_lens = []
         seq_lens = []
 
+
+        prompt_tokens = []
+        output_tokens = []
+
         req_pool_indices = self.req_to_token_pool.alloc(bs)
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
         for i in range(bs):
             flatten_input_ids.extend(input_ids[i])
+            prompt_tokens.append(input_ids[i])
+            output_tokens.append(output_ids[i])
             extend_lens.append(len(input_ids[i]))
 
             if len(prefix_indices[i]) == 0:
@@ -256,6 +316,15 @@ class Batch:
         self.input_ids = torch.tensor(
             flatten_input_ids, dtype=torch.int32, device=device
         )
+
+        self.prompt_tokens = torch.tensor(
+            prompt_tokens, dtype=torch.long, device=device
+        )
+
+        self.output_tokens = torch.tensor(
+            output_tokens, dtype=torch.long, device=device
+        )
+
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
@@ -386,6 +455,9 @@ class Batch:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
             ]
+
+        print("prepare_for_decode", input_ids)
+
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
         self.prefix_lens = None
@@ -479,6 +551,12 @@ class Batch:
                     logits[i].masked_fill_(~allowed_mask, float("-inf"))
 
         # TODO(lmzheng): apply penalty
+        logits = _apply_penalties(logits, self.prompt_tokens,
+                                  self.output_tokens,
+                                  self.presence_penalties,
+                                  self.frequency_penalties,
+                                  self.repetition_penalties)
+
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = _top_p_top_k(probs, self.top_ps, self.top_ks)
         sampled_index = torch.multinomial(probs_sort, num_samples=1)

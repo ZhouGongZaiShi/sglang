@@ -453,6 +453,12 @@ class ModelRpcServer(rpyc.Service):
         self.handle_finished_requests(batch)
 
     def forward_decode_batch(self, batch: Batch):
+        output_ids = [r.output_ids[:] for r in batch.reqs]
+        output_tokens = [output_ids[i] for i in range(len(batch.reqs))]
+        batch.output_tokens = torch.tensor(
+            output_tokens, dtype=torch.long, device="cuda"
+        )
+
         # check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
@@ -515,6 +521,7 @@ class ModelRpcServer(rpyc.Service):
         # Check finish condition
         for i, (req, next_tok_id) in enumerate(zip(reqs, next_token_ids)):
             req.completion_tokens_wo_jump_forward += 1
+            print("next_tok_id", req, next_tok_id)
             req.output_ids.append(next_tok_id)
             req.check_finished()
 
